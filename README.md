@@ -1,0 +1,2 @@
+# foundationpose_with_yolo26_ros2
+基于ros2的yolo26和foundationpose实现物体6d位姿估计
