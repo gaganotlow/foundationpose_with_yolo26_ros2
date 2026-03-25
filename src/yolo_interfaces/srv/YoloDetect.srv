@@ -1,0 +1,10 @@
+# Request: 请求指定类别的检测结果
+string class_name
+---
+# Response
+std_msgs/Header header
+bool success
+string message
+sensor_msgs/Image rgb
+sensor_msgs/Image depth
+yolo_interfaces/YoloDetection[] detections

@@ -1,0 +1,8 @@
+# Request：请求 FoundationPose 6D 位姿估计
+string class_name         # 检测目标类别，如 "k2c"，传给 yolo_detect 服务
+int32 est_refine_iter     # 精化迭代次数，0 = 使用节点默认值（由参数 est_refine_iter 设置）
+---
+# Response
+bool success
+string message
+geometry_msgs/PoseStamped pose   # 物体相对相机坐标系的 6D 位姿 (ob_in_cam)
