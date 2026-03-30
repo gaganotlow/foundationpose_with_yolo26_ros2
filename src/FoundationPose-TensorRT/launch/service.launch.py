@@ -1,40 +1,31 @@
 """
-FoundationPose 服务节点 Launch 文件
+FoundationPose-TensorRT 服务节点 Launch 文件
 
 使用方式：
-  ros2 launch foundationpose service.launch.py
+  ros2 launch foundationpose_tensorrt service.launch.py
 
 可选参数：
-  mesh_file           - 物体 .obj 文件路径（默认 demo_data/k2c/mesh/03.obj）
+  mesh_file           - 物体 .obj 文件路径
   yolo_service        - YOLO 服务名（默认 yolo_detect）
   camera_info_topic   - 相机内参话题（默认 /right_camera/color/camera_info）
-  est_refine_iter     - 精化迭代次数（默认 5）
-  debug               - 调试级别 0/1/2（默认 0）
-  debug_dir           - 调试输出目录（默认 /tmp/fp_debug）
-  conda_python        - conda 环境 Python 路径（默认 foundationpose_ga）
-
-环境要求：
-  FoundationPose 依赖（nvdiffrast、trimesh 等）必须在 conda foundationpose_ga 环境中。
-  launch 文件通过 prefix 参数直接指定 conda Python，无需手动 conda activate。
-  构建命令：
-    cd <ros2_ws>
-    colcon build --symlink-install --packages-select fp_interfaces foundationpose
-    source install/setup.bash
+  est_refine_iter     - 精化迭代次数（默认 3）
+  downsample_width    - 下采样宽度（默认 256）
+  chunk_size          - TensorRT chunk 大小（默认 128）
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+import os
 
 
 def generate_launch_description():
-    fp_src_dir = "/media/rykj/nvme/jetson/ga/code/test_ws/src/FoundationPose"
+    # 获取包的安装路径
+    pkg_dir = os.path.dirname(os.path.realpath(__file__))
+    fp_src_dir = os.path.join(pkg_dir, "..")  # 回到包根目录
 
     return LaunchDescription([
-        # ---- 环境变量：保证 colcon install 后也能找到 FoundationPose 源码 ----
-        SetEnvironmentVariable("FOUNDATIONPOSE_DIR", fp_src_dir),
-
         # ---- Launch 参数声明 ----
         DeclareLaunchArgument(
             "mesh_file",
@@ -53,8 +44,23 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "est_refine_iter",
-            default_value="5",
+            default_value="3",
             description="FoundationPose register 精化迭代次数",
+        ),
+        DeclareLaunchArgument(
+            "track_refine_iter",
+            default_value="2",
+            description="FoundationPose track 精化迭代次数",
+        ),
+        DeclareLaunchArgument(
+            "downsample_width",
+            default_value="256",
+            description="图像下采样宽度（0=不下采样）",
+        ),
+        DeclareLaunchArgument(
+            "chunk_size",
+            default_value="128",
+            description="TensorRT 引擎 chunk 大小",
         ),
         DeclareLaunchArgument(
             "debug",
@@ -63,7 +69,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "debug_dir",
-            default_value="/media/rykj/nvme/jetson/ga/code/ros2_ws/src/FoundationPose/fp_debug",
+            default_value="/tmp/fp_tensorrt_debug",
             description="调试文件输出目录",
         ),
         DeclareLaunchArgument(
@@ -71,24 +77,20 @@ def generate_launch_description():
             default_value="fp_detect",
             description="对外暴露的服务名称",
         ),
-        DeclareLaunchArgument(
-            "conda_python",
-            default_value="/media/rykj/nvme/jetson/miniconda3/envs/foundationpose_ga/bin/python3",
-            description="conda 环境 Python 解释器路径（含 FoundationPose 全部依赖）",
-        ),
 
-        # ---- FoundationPose 服务节点 ----
-        # prefix 指定 conda Python，解决 ros2 launch 子进程使用系统 Python 的问题
+        # ---- FoundationPose-TensorRT 服务节点 ----
         Node(
-            package="foundationpose",
+            package="foundationpose_tensorrt",
             executable="fp_service",
-            name="foundationpose_service_node",
-            prefix=LaunchConfiguration("conda_python"),
+            name="foundationpose_tensorrt_service_node",
             parameters=[{
                 "mesh_file":          LaunchConfiguration("mesh_file"),
                 "yolo_service":       LaunchConfiguration("yolo_service"),
                 "camera_info_topic":  LaunchConfiguration("camera_info_topic"),
                 "est_refine_iter":    LaunchConfiguration("est_refine_iter"),
+                "track_refine_iter":  LaunchConfiguration("track_refine_iter"),
+                "downsample_width":   LaunchConfiguration("downsample_width"),
+                "chunk_size":         LaunchConfiguration("chunk_size"),
                 "debug":              LaunchConfiguration("debug"),
                 "debug_dir":          LaunchConfiguration("debug_dir"),
                 "service_name":       LaunchConfiguration("service_name"),

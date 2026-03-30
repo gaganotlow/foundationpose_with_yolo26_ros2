@@ -25,9 +25,9 @@ class YoloServiceNode(Node):
         self.declare_parameter('engine_file', '/media/rykj/nvme/jetson/ga/code/niusuo_perception/models/seg26_s_640_table.engine')
         self.declare_parameter('conf_thresh', 0.5)
         self.declare_parameter('service_name', 'yolo_detect')
-        self.declare_parameter('input_topic', '/right_camera/color/image_raw')
-        self.declare_parameter('depth_topic', '/right_camera/depth/image_raw')
-        self.declare_parameter('camera_info_topic', '/right_camera/color/camera_info')
+        self.declare_parameter('input_topic', '/right_camera/right_camera/color/image_raw')
+        self.declare_parameter('depth_topic', '/right_camera/right_camera/depth/image_raw')
+        self.declare_parameter('camera_info_topic', '/right_camera/right_camera/color/camera_info')
 
         engine_file        = self.get_parameter('engine_file').value
         conf_thresh        = self.get_parameter('conf_thresh').value

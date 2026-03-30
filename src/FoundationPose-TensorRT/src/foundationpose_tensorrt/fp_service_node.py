@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FoundationPose ROS2 服务节点
+FoundationPose-TensorRT ROS2 服务节点
 
 提供 /fp_detect 服务（fp_interfaces/FpDetect）：
   - 调用 /yolo_detect 服务获取当前帧 RGB + Depth + Mask
-  - 运行 FoundationPose register，返回 6D 位姿（ob_in_cam）
-
-运行要求：
-  - 使用 foundationpose_ga conda 环境（含 FoundationPose 全部依赖 + rclpy）
-  - 使用 --symlink-install 构建，或设置 FOUNDATIONPOSE_DIR 环境变量
-
-典型用法：
-  ros2 launch foundationpose service.launch.py mesh_file:=/path/to/K2.obj class_name:=k2c
+  - 运行 FoundationPose-TensorRT register，返回 6D 位姿（ob_in_cam）
 """
 from __future__ import annotations
 
@@ -22,37 +15,9 @@ import time
 import traceback
 
 import cv2
-import imageio
 import numpy as np
 
-# -----------------------------------------------------------------------
-# 将 FoundationPose 源码目录加入 Python 路径
-# 构建方式为 --symlink-install 时，__file__ 指向源码位置，相对路径即可。
-# 其他情况需设置环境变量 FOUNDATIONPOSE_DIR。
-# -----------------------------------------------------------------------
-_THIS_DIR = os.path.dirname(os.path.realpath(__file__))
-_FP_SRC = os.path.realpath(os.path.join(_THIS_DIR, ".."))
-
-if os.path.exists(os.path.join(_FP_SRC, "estimater.py")):
-    if _FP_SRC not in sys.path:
-        sys.path.insert(0, _FP_SRC)
-else:
-    _fp_env = os.environ.get("FOUNDATIONPOSE_DIR", "")
-    if _fp_env and os.path.exists(os.path.join(_fp_env, "estimater.py")):
-        if _fp_env not in sys.path:
-            sys.path.insert(0, _fp_env)
-    else:
-        raise ImportError(
-            "找不到 FoundationPose 源码目录。\n"
-            "请使用 --symlink-install 构建，或设置环境变量 FOUNDATIONPOSE_DIR=<FoundationPose 源码路径>"
-        )
-
-# FoundationPose 核心模块（需 conda foundationpose_ga 环境）
-import trimesh
-import nvdiffrast.torch as dr
-from scipy.spatial.transform import Rotation
-from estimater import FoundationPose, ScorePredictor, PoseRefinePredictor
-from Utils import set_logging_format, set_seed, draw_posed_3d_box, draw_xyz_axis
+from foundationpose_tensorrt import FoundationPoseWrapper, FoundationPoseWrapperConfig
 
 import rclpy
 from rclpy.node import Node
@@ -61,37 +26,46 @@ from rclpy.executors import MultiThreadedExecutor
 from cv_bridge import CvBridge
 from sensor_msgs.msg import CameraInfo
 from geometry_msgs.msg import PoseStamped
+from scipy.spatial.transform import Rotation
 
 from yolo_interfaces.srv import YoloDetect
 from fp_interfaces.srv import FpDetect
 
 
-class FpServiceNode(Node):
+class FpTensorRTServiceNode(Node):
+    """FoundationPose-TensorRT 服务节点"""
 
     def __init__(self):
-        super().__init__("foundationpose_service_node")
+        super().__init__("foundationpose_tensorrt_service_node")
 
+        # 参数声明
         self.declare_parameter("mesh_file", "")
         self.declare_parameter("yolo_service", "yolo_detect")
         self.declare_parameter("camera_info_topic", "/right_camera/right_camera/color/camera_info")
-        self.declare_parameter("est_refine_iter", 5)
+        self.declare_parameter("est_refine_iter", 3)
+        self.declare_parameter("track_refine_iter", 2)
+        self.declare_parameter("downsample_width", 256)
+        self.declare_parameter("chunk_size", 128)
         self.declare_parameter("debug", 0)
-        self.declare_parameter("debug_dir", "/media/rykj/nvme/jetson/ga/code/ros2_ws/src/FoundationPose/fp_debug")
+        self.declare_parameter("debug_dir", "/tmp/fp_tensorrt_debug")
         self.declare_parameter("service_name", "fp_detect")
 
+        # 获取参数
         self._mesh_file: str = self.get_parameter("mesh_file").value
         self._yolo_svc: str = self.get_parameter("yolo_service").value
         self._ci_topic: str = self.get_parameter("camera_info_topic").value
         self._est_iter: int = self.get_parameter("est_refine_iter").value
+        self._track_iter: int = self.get_parameter("track_refine_iter").value
+        self._downsample: int = self.get_parameter("downsample_width").value
+        self._chunk_size: int = self.get_parameter("chunk_size").value
         self._debug: int = self.get_parameter("debug").value
         self._debug_dir: str = self.get_parameter("debug_dir").value
         svc_name: str = self.get_parameter("service_name").value
 
         self._bridge = CvBridge()
         self._K: np.ndarray | None = None
-        self._est: FoundationPose | None = None
-        self._glctx = None
-        self._bbox: np.ndarray | None = None  # (2,3) AABB for visualization
+        self._fp_wrapper: FoundationPoseWrapper | None = None
+        self._mesh = None
         self._frame_count: int = 0
 
         # ReentrantCallbackGroup 允许在 service 回调中等待 client future
@@ -106,69 +80,65 @@ class FpServiceNode(Node):
             FpDetect, svc_name, self._fp_callback, callback_group=cb
         )
 
-        # 提前初始化估计器（如果已配置 mesh_file）
+        # 初始化 FoundationPose Wrapper
+        self._init_wrapper()
+
+        # 提前加载 mesh（如果已配置）
         if self._mesh_file:
             try:
-                self._init_estimator(self._mesh_file)
+                self._load_mesh(self._mesh_file)
             except Exception as e:
-                self.get_logger().error(f"估计器预初始化失败: {e}")
+                self.get_logger().error(f"Mesh 预加载失败: {e}")
 
         self.get_logger().info("=" * 60)
-        self.get_logger().info("FoundationPose 服务节点已启动")
+        self.get_logger().info("FoundationPose-TensorRT 服务节点已启动")
         self.get_logger().info(f"  服务名称:       /{svc_name}")
         self.get_logger().info(f"  YOLO 服务:      /{self._yolo_svc}")
         self.get_logger().info(f"  相机内参话题:   {self._ci_topic}")
-        self.get_logger().info(f"  Mesh 文件:      {self._mesh_file or '(未设置，请在请求前配置 mesh_file 参数)'}")
-        self.get_logger().info(f"  精化迭代次数:   {self._est_iter}")
+        self.get_logger().info(f"  Mesh 文件:      {self._mesh_file or '(未设置)'}")
+        self.get_logger().info(f"  精化迭代次数:   est={self._est_iter}, track={self._track_iter}")
+        self.get_logger().info(f"  下采样宽度:     {self._downsample}")
+        self.get_logger().info(f"  Chunk 大小:     {self._chunk_size}")
         self.get_logger().info("=" * 60)
 
-    # ------------------------------------------------------------------
-    # 相机内参回调
-    # ------------------------------------------------------------------
+    def _init_wrapper(self) -> None:
+        """初始化 FoundationPose Wrapper"""
+        try:
+            cfg = FoundationPoseWrapperConfig(
+                downsample_width=self._downsample if self._downsample > 0 else None,
+                est_refine_iter=self._est_iter,
+                track_refine_iter=self._track_iter,
+                chunk_size=self._chunk_size,
+            )
+            self._fp_wrapper = FoundationPoseWrapper(cfg=cfg)
+            self.get_logger().info("FoundationPose Wrapper 初始化成功")
+        except Exception as e:
+            self.get_logger().error(f"Wrapper 初始化失败: {e}")
+            raise
+
+    def _load_mesh(self, mesh_file: str) -> None:
+        """加载物体 mesh"""
+        if not os.path.exists(mesh_file):
+            raise FileNotFoundError(f"Mesh 文件不存在: {mesh_file}")
+
+        self.get_logger().info(f"加载 mesh: {mesh_file}")
+        self._mesh = FoundationPoseWrapper.load_mesh(mesh_file)
+        self._mesh_file = mesh_file
+        self.get_logger().info("Mesh 加载完成")
+
     def _on_ci(self, msg: CameraInfo) -> None:
+        """接收相机内参"""
         if self._K is None:
             self._K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+            if self._fp_wrapper:
+                self._fp_wrapper.set_camera_intrinsics(self._K)
             self.get_logger().info(
                 f"获取到相机内参 K: fx={self._K[0,0]:.2f} fy={self._K[1,1]:.2f} "
                 f"cx={self._K[0,2]:.2f} cy={self._K[1,2]:.2f}"
             )
 
-    # ------------------------------------------------------------------
-    # 初始化（或重新加载）FoundationPose 估计器
-    # ------------------------------------------------------------------
-    def _init_estimator(self, mesh_file: str) -> None:
-        if not os.path.exists(mesh_file):
-            raise FileNotFoundError(f"Mesh 文件不存在: {mesh_file}")
-
-        self.get_logger().info(f"初始化 FoundationPose 估计器，mesh: {mesh_file}")
-        set_seed(0)
-        os.makedirs(self._debug_dir, exist_ok=True)
-        os.makedirs(os.path.join(self._debug_dir, "vis"), exist_ok=True)
-
-        mesh = trimesh.load(mesh_file)
-        extents = mesh.extents
-        self._bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
-
-        if self._glctx is None:
-            self._glctx = dr.RasterizeCudaContext()
-
-        self._est = FoundationPose(
-            model_pts=mesh.vertices,
-            model_normals=mesh.vertex_normals,
-            mesh=mesh,
-            scorer=ScorePredictor(),
-            refiner=PoseRefinePredictor(),
-            debug_dir=self._debug_dir,
-            debug=self._debug,
-            glctx=self._glctx,
-        )
-        self._mesh_file = mesh_file
-        self.get_logger().info("FoundationPose 估计器初始化完成")
-
-    # ------------------------------------------------------------------
-    # 服务回调
-    # ------------------------------------------------------------------
     def _fp_callback(self, request: FpDetect.Request, response: FpDetect.Response):
+        """服务回调：执行位姿估计"""
         class_name = request.class_name.strip()
 
         if not class_name:
@@ -176,12 +146,9 @@ class FpServiceNode(Node):
             response.message = "class_name 不能为空"
             return response
 
-        if self._est is None:
+        if self._mesh is None:
             response.success = False
-            response.message = (
-                "估计器未初始化，请确认 mesh_file 参数已正确设置，"
-                f"例如: {_FP_SRC}/demo_data/k2c/mesh/03.obj"
-            )
+            response.message = "Mesh 未加载，请确认 mesh_file 参数已正确设置"
             return response
 
         if self._K is None:
@@ -236,7 +203,7 @@ class FpServiceNode(Node):
             )
             return response
 
-        # ------ 4. FoundationPose register ------
+        # ------ 4. FoundationPose-TensorRT register ------
         try:
             iter_count = (
                 request.est_refine_iter if request.est_refine_iter > 0 else self._est_iter
@@ -245,9 +212,14 @@ class FpServiceNode(Node):
                 f"开始 register: class={class_name}, iter={iter_count}, "
                 f"mask_px={int(mask.sum())}"
             )
-            pose = self._est.register(
-                K=self._K, rgb=rgb, depth=depth, ob_mask=mask, iteration=iter_count
-            )
+
+            # 重置场景并注册对象
+            self._fp_wrapper.reset_scene(rgb, depth)
+            pose = self._fp_wrapper.add_object(class_name, self._mesh, mask)
+
+            if pose is None:
+                raise RuntimeError("register 返回 None")
+
         except Exception as e:
             response.success = False
             response.message = f"FoundationPose register 失败: {e}"
@@ -277,26 +249,22 @@ class FpServiceNode(Node):
         response.pose = ps
         self.get_logger().info(f"位姿估计成功: {response.message}")
 
-        # ------ 6. 保存可视化（RGB + 3D 框 + 坐标轴） ------
-        self._save_vis(rgb, pose, class_name)
+        # ------ 6. 保存可视化（可选） ------
+        if self._debug > 0:
+            self._save_vis(rgb, pose, class_name)
 
         return response
 
     def _save_vis(self, rgb: np.ndarray, pose: np.ndarray, class_name: str) -> None:
-        """在 RGB 图上绘制 3D 包围框和坐标轴，保存到 debug_dir/vis/。"""
-        if self._bbox is None or self._K is None:
-            return
+        """保存可视化结果"""
         try:
-            vis = draw_posed_3d_box(self._K, img=rgb, ob_in_cam=pose, bbox=self._bbox)
-            vis = draw_xyz_axis(
-                vis, ob_in_cam=pose, scale=0.1, K=self._K,
-                thickness=3, transparency=0, is_input_rgb=True,
-            )
+            os.makedirs(os.path.join(self._debug_dir, "vis"), exist_ok=True)
+            vis = self._fp_wrapper.render_results()
             self._frame_count += 1
             out_path = os.path.join(
                 self._debug_dir, "vis", f"{class_name}_{self._frame_count:06d}.png"
             )
-            imageio.imwrite(out_path, vis)
+            cv2.imwrite(out_path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
             self.get_logger().info(f"可视化已保存: {out_path}")
         except Exception:
             self.get_logger().warning(f"可视化保存失败:\n{traceback.format_exc()}")
@@ -326,9 +294,8 @@ class FpServiceNode(Node):
 
 
 def main():
-    set_logging_format()
     rclpy.init()
-    node = FpServiceNode()
+    node = FpTensorRTServiceNode()
     # MultiThreadedExecutor 允许 service 回调在等待 YOLO future 时不阻塞其他回调
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)

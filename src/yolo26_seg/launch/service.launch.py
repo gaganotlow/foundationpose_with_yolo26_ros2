@@ -22,17 +22,17 @@ def generate_launch_description():
     )
     input_topic_arg = DeclareLaunchArgument(
         'input_topic',
-        default_value='/right_camera/color/image_raw',
+        default_value='/right_camera/right_camera/color/image_raw',
         description='RGB图像话题'
     )
     depth_topic_arg = DeclareLaunchArgument(
         'depth_topic',
-        default_value='/right_camera/depth/image_raw',
+        default_value='/right_camera/right_camera/depth/image_raw',
         description='深度图像话题'
     )
     camera_info_topic_arg = DeclareLaunchArgument(
         'camera_info_topic',
-        default_value='/right_camera/color/camera_info',
+        default_value='/right_camera/right_camera/color/camera_info',
         description='相机信息话题'
     )
 
